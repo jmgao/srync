@@ -127,22 +127,26 @@ struct ClientFileProvider : public FileProvider {
     auto it = requests_.begin();
     while (it != requests_.end()) {
       if (it->offset >= expected_size_) {
+        ERROR("Received read past the end of the file (offset = {})", it->offset);
         fuse_reply_err(it->req, 0);
         it = requests_.erase(it);
         continue;
-      } else if (it->offset >= size_) {
+      }
+
+      // We're not using direct I/O, so requests have to be fully satisfied.
+      if (size_ != expected_size_ && it->offset + it->size >= size_) {
         ++it;
         continue;
       }
 
+      static_assert(sizeof(off_t) == sizeof(uint64_t));
       uint64_t bytes_available = size_ - it->offset;
       uint64_t len = std::min(bytes_available, it->size);
-      if (len > 128 * 1024) {
-        len = 128 * 1024;
+      if (len > 256 * 1024) {
+        ERROR("Received read request of size {}, expected max of 256kiB readahead", len);
       }
-      Block buffer(len);
 
-      static_assert(sizeof(off_t) == sizeof(uint64_t));
+      Block buffer(len);
       ssize_t rc = TEMP_FAILURE_RETRY(pread(fd_.get(), buffer.data(), buffer.size(), it->offset));
       if (rc == -1) {
         int err = errno;

@@ -384,7 +384,6 @@ void Fs::fs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
   if (File* f = inode->as_file()) {
     std::unique_ptr<OpenFile> openfile = f->open();
     fi->fh = reinterpret_cast<uint64_t>(openfile.release());
-    fi->direct_io = 1;
     DEBUG("fs_openfile(ino={}) = {:#x}", ino, fi->fh);
     fuse_reply_open(req, fi);
   } else {
