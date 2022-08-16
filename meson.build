@@ -31,7 +31,11 @@ libfuse = libfuse_proj.get_variable('libfuse_dep')
 srync = executable(
   'srync',
   sources: [
-    'src/srync.cpp'
+    'src/client.cpp',
+    'src/fs.cpp',
+    'src/iovector.cpp',
+    'src/server.cpp',
+    'src/srync.cpp',
   ],
   include_directories: ['src'],
   dependencies: [
