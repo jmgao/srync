@@ -308,7 +308,7 @@ struct ClientConnection : public Connection {
     p->new_checksum = checksum;
     write(CommandType::BeginFileUpdate, std::move(buf));
 
-    return flush_updates();
+    return true;
   }
 
  public:
@@ -431,7 +431,7 @@ struct ClientConnection : public Connection {
         }
       }
     }
-    return true;
+    return flush_updates();
   }
 
   struct RemoteFile {
