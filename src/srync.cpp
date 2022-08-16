@@ -1,6 +1,7 @@
 #include "srync.h"
 
 #include <err.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,16 +17,20 @@
 #include "srync.h"
 
 [[noreturn]] static void usage(int rc) {
-  printf("Usage: srync [OPTION]... [-H HOST] MOUNTPOINT\n");
-  printf("       srync [OPTION]... -l PATH...\n");
+  printf("Usage: srync [OPTION]... -l PATH...\n");
+  printf("       Listen for incoming connections, exposing PATHs as files.\n");
   printf("\n");
-  printf("  -h           print help\n");
-  printf("  -V           print version\n");
-  printf("  -v           increase verbosity (can be repeated)\n");
+  printf("       srync [OPTION]... MOUNTPOINT\n");
+  printf("       Connect to a srync daemon and mount it at MOUNTPOINT");
   printf("\n");
-  printf("  -l           listen for incoming connections\n");
-  printf("  -p PORT      use PORT instead of default (5038)\n");
-  printf("  -H HOST      use HOST instead of default (localhost)\n");
+  printf("\n");
+  printf("  -l, --listen         listen for incoming connections\n");
+  printf("  -H, --host HOST      use HOST instead of default (localhost)\n");
+  printf("  -p, --port PORT      use PORT instead of default (5038)\n");
+  printf("  -v, --verbose        increase verbosity (can be repeated)\n");
+  printf("\n");
+  printf("  -h, --help           print help\n");
+  printf("  -V, --version        print version\n");
   exit(rc);
 }
 
@@ -36,7 +41,52 @@ int main(int argc, char** argv) {
   std::string host = "localhost";
   int port = 5038;
 
-  while ((opt = getopt(argc, argv, "hVvlH:p:")) != -1) {
+  struct option longopts[] = {
+    {
+      .name = "help",
+      .has_arg = false,
+      .flag = nullptr,
+      .val = 'h',
+    },
+    {
+      .name = "version",
+      .has_arg = false,
+      .flag = nullptr,
+      .val = 'V',
+    },
+    {
+      .name = "verbose",
+      .has_arg = false,
+      .flag = nullptr,
+      .val = 'v',
+    },
+    {
+      .name = "listen",
+      .has_arg = false,
+      .flag = nullptr,
+      .val = 'l',
+    },
+    {
+      .name = "port",
+      .has_arg = true,
+      .flag = nullptr,
+      .val = 'p',
+    },
+    {
+      .name = "host",
+      .has_arg = true,
+      .flag = nullptr,
+      .val = 'H',
+    },
+    {
+      .name = nullptr,
+      .has_arg = false,
+      .flag = nullptr,
+      .val = 0,
+    },
+  };
+
+  while ((opt = getopt_long(argc, argv, "hVvlH:p:", longopts, nullptr)) != -1) {
     switch (opt) {
       case 'h':
         usage(0);
@@ -66,7 +116,6 @@ int main(int argc, char** argv) {
         break;
 
       case '?':
-        fprintf(stderr, "srync: unrecognized option '%s'\n", optarg);
         exit(1);
     }
   }
