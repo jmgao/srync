@@ -8,6 +8,7 @@ using FileId = uint16_t;
 using UpdateId = uint32_t;
 
 enum class ChecksumAlgorithm : uint8_t {
+  Invalid,
   TimestampAndSize,
 };
 
@@ -17,6 +18,9 @@ struct fmt::formatter<ChecksumAlgorithm> : formatter<std::string_view> {
   auto format(ChecksumAlgorithm c, FormatContext& ctx) const {
     std::string_view name = "<unknown>";
     switch (c) {
+      case ChecksumAlgorithm::Invalid:
+        name = "Invalid";
+
       case ChecksumAlgorithm::TimestampAndSize:
         name = "TimestampAndSize";
         break;
