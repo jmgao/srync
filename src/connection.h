@@ -31,10 +31,10 @@ struct Connection {
   }
 
   Connection(const Connection& copy) = delete;
-  Connection(Connection&& move) = default;
+  Connection(Connection&& move) = delete;
 
   Connection& operator=(const Connection& copy) = delete;
-  Connection& operator=(Connection&& move) = default;
+  Connection& operator=(Connection&& move) = delete;
 
   void write(CommandType command, Block packet_data) {
     if (packet_data.size() > UINT32_MAX) {
@@ -50,6 +50,7 @@ struct Connection {
     };
     memcpy(header_buf.data(), &header, sizeof(header));
 
+    absl::MutexLock lock(&write_mutex_);
     output_queue_.append(std::move(header_buf));
     output_queue_.append(std::move(packet_data));
     update_epollout();
@@ -74,9 +75,13 @@ struct Connection {
  protected:
   virtual bool process_read(const PacketHeader& header, Block data) = 0;
 
-  size_t bytes_queued() const { return output_queue_.size(); }
+  size_t bytes_queued() const {
+    absl::MutexLock lock(&write_mutex_);
+    return output_queue_.size();
+  }
 
   bool flush_writes() {
+    absl::MutexLock lock(&write_mutex_);
     while (!output_queue_.empty()) {
       std::vector<struct iovec> iovecs = output_queue_.iovecs();
       ssize_t rc = TEMP_FAILURE_RETRY(writev(fd_.get(), iovecs.data(), iovecs.size()));
@@ -158,7 +163,7 @@ struct Connection {
     return true;
   }
 
-  void update_epollout() {
+  void update_epollout() ABSL_EXCLUSIVE_LOCKS_REQUIRED(write_mutex_) {
     if (!output_queue_.empty() != epollout_) {
       struct epoll_event event;
       event.events = EPOLLIN;
@@ -184,8 +189,9 @@ struct Connection {
 
   IOVector input_queue_;
 
-  bool epollout_ = false;
-  IOVector output_queue_;
+  mutable absl::Mutex write_mutex_;
+  bool epollout_ ABSL_GUARDED_BY(write_mutex_) = false;
+  IOVector output_queue_ ABSL_GUARDED_BY(write_mutex_);
 
   borrowed_fd epfd_;
   unique_fd fd_;
