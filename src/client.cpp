@@ -81,13 +81,14 @@ struct PriorityBlock {
 };
 
 struct ClientFileProvider : public FileProvider {
-  explicit ClientFileProvider(FileId file_id, UpdateId update_id, Checksum checksum, unique_fd fd,
-                              uint64_t expected_size, PriorityBlock* priority_block)
-      : file_id_(file_id),
+  explicit ClientFileProvider(unique_fd fd, FileId file_id, UpdateId update_id, Checksum checksum,
+                              uint64_t expected_size, int64_t mtime, PriorityBlock* priority_block)
+      : fd_(std::move(fd)),
+        file_id_(file_id),
         update_id_(update_id),
         checksum_(checksum),
-        fd_(std::move(fd)),
         expected_size_(expected_size),
+        mtime_(mtime),
         priority_block_(priority_block) {}
 
   virtual void read(fuse_req_t req, uint64_t size, uint64_t offset) override final {
@@ -160,12 +161,14 @@ struct ClientFileProvider : public FileProvider {
     }
   }
 
+  unique_fd fd_;
+
   const FileId file_id_;
   const UpdateId update_id_;
   const Checksum checksum_;
 
-  unique_fd fd_;
   const uint64_t expected_size_;
+  const int64_t mtime_;
 
   absl::Mutex mutex_;
   std::atomic<uint64_t> size_ = 0;
@@ -268,8 +271,9 @@ struct ServerConnection : public Connection {
       return false;
     }
 
-    auto fp = std::make_shared<ClientFileProvider>(p->file_id, p->update_id, p->new_checksum,
-                                                   std::move(fd), p->size, &priority_block_);
+    auto fp =
+      std::make_shared<ClientFileProvider>(std::move(fd), p->file_id, p->update_id, p->new_checksum,
+                                           p->size, p->mtime, &priority_block_);
     fs_.add_file(std::move(*filename), p->size, p->mtime, fp);
     updates_[p->update_id] = std::move(fp);
 
@@ -331,7 +335,8 @@ struct ServerConnection : public Connection {
     }
 
     if (p->success) {
-      if (!cache_.add_version(it->second->file_id_, it->second->checksum_, it->second->fd_, true)) {
+      if (!cache_.add_version(it->second->file_id_, it->second->checksum_, it->second->size_,
+                              it->second->mtime_, it->second->fd_, true)) {
         ERROR("Failed to link file into cache");
         return false;
       }

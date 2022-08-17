@@ -26,12 +26,6 @@
 #include "iovector.h"
 #include "srync.h"
 
-struct FileGenerations {
-  std::string filename;
-  std::optional<Checksum> latest;
-  absl::flat_hash_map<Checksum, FileGeneration> generations;
-};
-
 static unique_fd listen_socket(const std::string& host, int port) {
   std::string port_str = std::to_string(port);
   struct addrinfo* ai;
@@ -118,10 +112,8 @@ static unique_fd accept_client(borrowed_fd sockfd) {
 }
 
 struct ClientConnection : public Connection {
-  ClientConnection(borrowed_fd epollfd, unique_fd fd,
-                   const absl::flat_hash_map<FileId, FileGenerations>& files,
-                   GenerationCache& cache)
-      : Connection(epollfd, std::move(fd)), files_(files), cache_(cache) {}
+  ClientConnection(borrowed_fd epollfd, unique_fd fd, GenerationCache& cache)
+      : Connection(epollfd, std::move(fd)), cache_(cache) {}
 
  private:
   void send_hello() {
@@ -221,23 +213,23 @@ struct ClientConnection : public Connection {
   }
 
   bool handle_update(FileId id) {
-    INFO("Processing update for file {}, client fd={}", id, fd_.get());
-    auto file_it = files_.find(id);
-    if (file_it == files_.end()) {
+    auto filename = cache_.filename(id);
+    if (!filename) {
       ERROR("Failed to find file to update: id={}", id);
       return false;
     }
 
+    INFO("Processing update for {}, client fd={}", *filename, fd_.get());
     if (!remote_files_[id].advertised) {
       // We haven't told the other end about our file yet.
       remote_files_[id].advertised = true;
 
-      std::string_view filename = file_it->second.filename;
-      Block buf(sizeof(AddFile) + filename.size());
+      INFO("Advertising {}, client fd={}", *filename, fd_.get());
+      Block buf(sizeof(AddFile) + filename->size());
       auto p = reinterpret_cast<AddFile*>(buf.data());
       p->file_id = id;
-      p->filename_length = filename.size();
-      memcpy(p->filename, filename.data(), filename.size());
+      p->filename_length = filename->size();
+      memcpy(p->filename, filename->data(), filename->size());
       this->write(CommandType::AddFile, std::move(buf));
       return true;
     }
@@ -250,17 +242,16 @@ struct ClientConnection : public Connection {
   }
 
   bool start_update(FileId id) {
-    INFO("Starting update for file {}, client fd={}", id, fd_.get());
-
-    auto file_it = files_.find(id);
-    if (file_it == files_.end()) {
+    absl::MutexLock lock(&cache_.files_mutex_);
+    auto file_it = cache_.files_.find(id);
+    if (file_it == cache_.files_.end()) {
       ERROR("Failed to find file to update: id={}", id);
       return false;
     }
 
+    const std::string& filename = file_it->second.filename;
     if (!file_it->second.latest) {
-      WARN("Updating file {} which doesn't have a latest checksum (deleted?)",
-           file_it->second.filename);
+      WARN("Updating file {} which doesn't have a latest checksum (deleted?)", filename);
       return false;
     }
 
@@ -270,27 +261,27 @@ struct ClientConnection : public Connection {
       ERROR("Updated file generation is missing");
       return false;
     }
-    const FileGeneration& current_generation = gen_it->second;
+    const auto& current_generation = gen_it->second;
 
     // TODO: Check the remote's generations.
     if (remote_files_[id].generations.contains(checksum)) {
       // TODO: Do a rebase.
-      INFO("Client has file {} generation {}, but we don't know how to use it yet...", id,
+      INFO("Client has {} generation {}, but we don't know how to use it yet...", filename,
            checksum.str());
     }
 
     if (remote_files_[id].current_generation == checksum) {
-      INFO("Client is already on file {}, generation {}", id, checksum.str());
+      INFO("Client is already on {}, generation {}", id, checksum.str());
       return true;
     }
     remote_files_[id].current_generation = checksum;
 
-    INFO("Starting update of file {} to generation {}", id, checksum.str());
+    INFO("Starting update of {} to generation {}", filename, checksum.str());
     UpdateId update_id = next_update_id_.fetch_add(1);
 
-    unique_fd target_file = cache_.open_file_version(id, checksum);
+    unique_fd target_file = cache_.open_file_version_locked(id, checksum);
     if (target_file == -1) {
-      ERROR("Failed to open file {} generation {}: {}", id, checksum.str(), strerror(errno));
+      ERROR("Failed to open {} generation {}: {}", filename, checksum.str(), strerror(errno));
       return false;
     }
     updates_[update_id].fd = std::move(target_file);
@@ -417,7 +408,7 @@ struct ClientConnection : public Connection {
 
     if (!advertised_) {
       // If we haven't sent anything yet, advertise all of the files.
-      for (auto& [id, _] : files_) {
+      for (auto id : cache_.ids()) {
         if (!handle_update(id)) {
           return false;
         }
@@ -447,7 +438,6 @@ struct ClientConnection : public Connection {
   };
 
   absl::flat_hash_map<FileId, RemoteFile> remote_files_;
-  const absl::flat_hash_map<FileId, FileGenerations>& files_;
   GenerationCache& cache_;
 
   struct Update {
@@ -488,7 +478,6 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
   }
 
   FileMonitor file_monitor;
-  absl::flat_hash_map<FileId, FileGenerations> files;
   absl::flat_hash_map<FileId, std::filesystem::path> monitored_paths;
   std::vector<FileId> changed_files;
 
@@ -498,9 +487,7 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
     file_monitor.add_watch(path, id);
     cache.register_file(id, path.filename());
 
-    files[id].filename = path.filename();
     monitored_paths[id] = path;
-
     changed_files.push_back(id);
 
     INFO("File {} => {}", id, path.c_str());
@@ -525,19 +512,8 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
   absl::flat_hash_map<borrowed_fd, std::unique_ptr<ClientConnection>> clients;
   while (true) {
     for (FileId changed_file : changed_files) {
-      std::optional<FileGeneration> generation;
-      const auto& monitored_path = monitored_paths[changed_file];
-      cache.update_file(&generation, changed_file, monitored_path);
-      if (generation) {
-        INFO("New generation discovered for file {}", monitored_path.c_str());
-        files[changed_file].latest = generation->checksum;
-        files[changed_file].generations[generation->checksum] = *generation;
-      } else {
-        INFO("File {} disappeared", monitored_path.c_str());
-        files[changed_file].latest.reset();
-      }
+      cache.update_file(changed_file, monitored_paths[changed_file]);
     }
-
     for (auto& [_, connection] : clients) {
       connection->update_files(changed_files);
     }

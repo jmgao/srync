@@ -193,7 +193,8 @@ struct GenerationCache {
     return tmpfile;
   }
 
-  bool add_version_locked(FileId id, Checksum checksum, borrowed_fd fd, bool overwrite = false)
+  bool add_version_locked(FileId id, Checksum checksum, uint64_t size, int64_t mtime,
+                          borrowed_fd fd, bool overwrite = false)
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(files_mutex_) {
     auto it = files_.find(id);
     if (it == files_.end()) {
@@ -201,6 +202,11 @@ struct GenerationCache {
       return {};
     }
 
+    FileGeneration gen = {
+      .size = size,
+      .mtime = mtime,
+      .checksum = checksum,
+    };
     std::string checksum_str = checksum.str();
     INFO("Calculated checksum for updated file {}: {}", id, checksum_str);
     std::filesystem::path cache_path = fmt::format(
@@ -211,6 +217,8 @@ struct GenerationCache {
       // TODO: Verify its checksum, once we actually start using real checksums?
       if (!overwrite) {
         INFO("Cached file already exists: {}", cache_path.c_str());
+        it->second.latest = checksum;
+        it->second.generations[checksum] = gen;
         return true;
       } else {
         INFO("Cached file already exists, unlinking: {}", cache_path.c_str());
@@ -227,17 +235,19 @@ struct GenerationCache {
       return false;
     }
     INFO("Created cache file: {}", cache_path.c_str());
-    it->second.generations.insert(checksum);
+    it->second.latest = checksum;
+    it->second.generations[checksum] = gen;
     return true;
   }
 
-  bool add_version(FileId id, Checksum checksum, borrowed_fd fd, bool overwrite = false) {
+  bool add_version(FileId id, Checksum checksum, uint64_t size, int64_t mtime, borrowed_fd fd,
+                   bool overwrite = false) {
     absl::MutexLock lock(&files_mutex_);
-    return add_version_locked(id, checksum, std::move(fd), overwrite);
+    return add_version_locked(id, checksum, size, mtime, fd, overwrite);
   }
 
-  unique_fd open_file_version(FileId id, Checksum checksum) const {
-    absl::MutexLock lock(&files_mutex_);
+  unique_fd open_file_version_locked(FileId id, Checksum checksum) const
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(files_mutex_) {
     auto it = files_.find(id);
     if (it == files_.end()) {
       ERROR("Failed to find filename for file {}", id);
@@ -249,9 +259,12 @@ struct GenerationCache {
     return result;
   }
 
-  bool update_file(std::optional<FileGeneration>* out_generation, FileId id,
-                   const std::filesystem::path& path) {
-    out_generation->reset();
+  unique_fd open_file_version(FileId id, Checksum checksum) const {
+    absl::MutexLock lock(&files_mutex_);
+    return open_file_version_locked(id, checksum);
+  }
+
+  unique_fd clone_file(uint64_t* out_size, int64_t* out_mtime, const std::filesystem::path& path) {
     // Copy the file into a temporary file, first.
     unique_fd tmpfile = open_tmpfile();
     if (tmpfile == -1) {
@@ -262,13 +275,13 @@ struct GenerationCache {
     unique_fd updated_file(open(path.c_str(), O_RDONLY | O_CLOEXEC));
     if (updated_file == -1) {
       WARN("Failed to open updated file: {}", strerror(errno));
-      return true;
+      return {};
     }
 
     struct stat st;
     if (fstat(updated_file.get(), &st) != 0) {
       ERROR("fstat failed: {}", strerror(errno));
-      return true;
+      return {};
     }
 
     size_t size = st.st_size;
@@ -290,7 +303,7 @@ struct GenerationCache {
           }
         } else {
           ERROR("TODO: read/write fallback unimplemented!");
-          exit(1);
+          abort();
         }
 
         size -= rc;
@@ -300,40 +313,48 @@ struct GenerationCache {
     struct timespec times[2] = {st.st_mtim, st.st_mtim};
     if (futimens(tmpfile.get(), times) != 0) {
       ERROR("Failed to set temporary file timestamps: {}", strerror(errno));
-      return false;
+      abort();
+    }
+    *out_size = size;
+    *out_mtime = st.st_mtim.tv_sec;
+    return tmpfile;
+  }
+
+  void update_file(FileId id, const std::filesystem::path& path) {
+    uint64_t size;
+    int64_t mtime;
+    unique_fd tmpfile = clone_file(&size, &mtime, path);
+    if (tmpfile == -1) {
+      INFO("File {} disappeared", path.c_str());
+      absl::MutexLock lock(&files_mutex_);
+      files_.at(id).latest.reset();
+      return;
     }
 
     Checksum checksum;
     if (!calculate_checksum(&checksum, tmpfile)) {
-      return false;
+      abort();
     }
 
     // Check to see if we already have this generation tracked.
-    {
-      absl::MutexLock lock(&files_mutex_);
-      auto it = files_.find(id);
-      if (it == files_.end()) {
-        ERROR("Unknown changed file id: {}", id);
-        exit(1);
-      }
-
-      if (it->second.generations.contains(checksum)) {
-        INFO("File generation already exists");
-      } else if (!add_version_locked(id, checksum, std::move(tmpfile))) {
-        return false;
-      }
+    absl::MutexLock lock(&files_mutex_);
+    auto it = files_.find(id);
+    if (it == files_.end()) {
+      ERROR("Unknown changed file id: {}", id);
+      abort();
     }
 
-    FileGeneration gen = {
-      .size = size,
-      .mtime = st.st_mtim.tv_sec,
-      .checksum = checksum,
-    };
-    *out_generation = gen;
-    return true;
+    if (it->second.generations.contains(checksum)) {
+      INFO("File generation already exists");
+    } else if (!add_version_locked(id, checksum, size, mtime, std::move(tmpfile))) {
+      ERROR("Failed to add file to cache");
+      abort();
+    }
+
+    INFO("New generation discovered for file {}", path.c_str());
   }
 
-  std::optional<std::string> filename(FileId id) {
+  std::optional<std::string> filename(FileId id) const {
     absl::MutexLock lock(&files_mutex_);
     auto it = files_.find(id);
     if (it == files_.end()) {
@@ -342,16 +363,34 @@ struct GenerationCache {
     return it->second.filename;
   }
 
+  std::vector<FileId> ids() const {
+    std::vector<FileId> result;
+
+    absl::MutexLock lock(&files_mutex_);
+    for (auto& [id, _] : files_) {
+      result.push_back(id);
+    }
+    return result;
+  }
+
   const ChecksumAlgorithm checksum_algo_;
 
   const std::filesystem::path directory_;
   unique_fd dirfd_;
 
+  struct FileGeneration {
+    uint64_t size;
+    int64_t mtime;
+    Checksum checksum;
+  };
+
   struct File {
     std::string filename;
     unique_fd cache_directory;
-    absl::flat_hash_set<Checksum> generations;
+    std::optional<Checksum> latest;
+    absl::flat_hash_map<Checksum, FileGeneration> generations;
   };
+
   mutable absl::Mutex files_mutex_;
   absl::flat_hash_map<FileId, File> files_ ABSL_GUARDED_BY(files_mutex_);
 };
