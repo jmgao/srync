@@ -31,7 +31,7 @@ struct Checksum {
   union {
     uint8_t bytes[32];
     struct {
-      uint64_t timestamp;
+      int64_t timestamp;
       uint64_t size;
       char padding[16];
     } timestamp_and_size;
@@ -207,8 +207,8 @@ struct BeginFileUpdate {
   FileId file_id;
   UpdateType update_type;
   CompressionType compression_type;
-  uint64_t mtime;
   uint64_t size;
+  int64_t mtime;
   Checksum old_checksum;
   Checksum new_checksum;
 };

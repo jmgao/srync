@@ -302,8 +302,8 @@ struct ClientConnection : public Connection {
     p->file_id = id;
     p->update_type = UpdateType::FullTransfer;
     p->compression_type = CompressionType::None;
-    p->mtime = current_generation.mtime;
     p->size = current_generation.size;
+    p->mtime = current_generation.mtime;
     memset(&p->old_checksum, 0, sizeof(p->old_checksum));
     p->new_checksum = checksum;
     write(CommandType::BeginFileUpdate, std::move(buf));

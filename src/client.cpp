@@ -270,7 +270,7 @@ struct ServerConnection : public Connection {
 
     auto fp = std::make_shared<ClientFileProvider>(p->file_id, p->update_id, p->new_checksum,
                                                    std::move(fd), p->size, &priority_block_);
-    fs_.add_file(std::move(*filename), p->mtime, p->size, fp);
+    fs_.add_file(std::move(*filename), p->size, p->mtime, fp);
     updates_[p->update_id] = std::move(fp);
 
     INFO("Received BeginFileUpdate: id={} file={}", p->update_id, p->file_id);

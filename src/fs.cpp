@@ -98,11 +98,11 @@ std::unique_ptr<OpenDir> Directory::open() {
   return std::make_unique<OpenDir>(this->parent_, std::move(children));
 }
 
-File::File(Ino ino, std::string name, uint64_t mtime, uint64_t size,
+File::File(Ino ino, std::string name, uint64_t size, int64_t mtime,
            std::shared_ptr<FileProvider> provider)
     : Inode(InodeType::File, ino, std::move(name)),
-      mtime_(mtime),
       size_(size),
+      mtime_(mtime),
       provider_(std::move(provider)) {}
 
 void File::stat(struct stat* st, double* timeout) const {
@@ -136,10 +136,10 @@ Fs::~Fs() {
   }
 }
 
-void Fs::add_file(std::string filename, uint64_t mtime, uint64_t size,
+void Fs::add_file(std::string filename, uint64_t size, int64_t mtime,
                   std::shared_ptr<FileProvider> provider) {
   Ino ino = this->next_ino();
-  auto inode = std::make_shared<File>(ino, std::move(filename), mtime, size, std::move(provider));
+  auto inode = std::make_shared<File>(ino, std::move(filename), size, mtime, std::move(provider));
 
   {
     absl::MutexLock lock(&inode_mutex_);

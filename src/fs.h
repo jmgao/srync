@@ -86,7 +86,7 @@ struct FileProvider {
 };
 
 struct File : public Inode {
-  File(Ino ino, std::string name, uint64_t mtime, uint64_t size,
+  File(Ino ino, std::string name, uint64_t size, int64_t mtime,
        std::shared_ptr<FileProvider> provider);
   virtual ~File() = default;
 
@@ -95,8 +95,8 @@ struct File : public Inode {
   virtual void stat(struct stat* st, double* timeout) const override final;
   void read(fuse_req_t req, uint64_t size, uint64_t offset);
 
-  const uint64_t mtime_;
   const uint64_t size_;
+  const int64_t mtime_;
   const std::shared_ptr<FileProvider> provider_;
 };
 
@@ -106,7 +106,7 @@ struct Fs {
 
   static Fs* from(fuse_req_t req) { return static_cast<Fs*>(fuse_req_userdata(req)); }
 
-  void add_file(std::string filename, uint64_t mtime, uint64_t size,
+  void add_file(std::string filename, uint64_t size, int64_t mtime,
                 std::shared_ptr<FileProvider> provider);
   bool mount(const std::filesystem::path& path);
   void run();
