@@ -18,6 +18,7 @@
 #include <absl/container/btree_set.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <absl/synchronization/mutex.h>
 #include <absl/types/span.h>
 #include <spdlog/spdlog.h>
 
@@ -25,6 +26,7 @@
 #include "gencache.h"
 #include "iovector.h"
 #include "srync.h"
+#include "update_engine.h"
 
 static unique_fd listen_socket(const std::string& host, int port) {
   std::string port_str = std::to_string(port);
@@ -111,9 +113,23 @@ static unique_fd accept_client(borrowed_fd sockfd) {
   return client_fd;
 }
 
-struct ClientConnection : public Connection {
-  ClientConnection(borrowed_fd epollfd, unique_fd fd, GenerationCache& cache)
-      : Connection(epollfd, std::move(fd)), cache_(cache) {}
+struct ClientConnection : public Connection, UpdateServer {
+ private:
+  ClientConnection(borrowed_fd epollfd, unique_fd fd, GenerationCache& cache,
+                   UpdateEngine& update_engine)
+      : Connection(epollfd, std::move(fd)), cache_(cache), update_engine_(update_engine) {}
+
+ public:
+  ~ClientConnection() { update_engine_.unregister_connection(update_handle_); }
+
+  static std::shared_ptr<ClientConnection> construct(borrowed_fd epollfd, unique_fd fd,
+                                                     GenerationCache& cache,
+                                                     UpdateEngine& update_engine) {
+    std::shared_ptr<ClientConnection> result(
+      new ClientConnection(epollfd, std::move(fd), cache, update_engine));
+    result->update_handle_ = update_engine.register_connection(result);
+    return result;
+  }
 
  private:
   void send_hello() {
@@ -183,14 +199,7 @@ struct ClientConnection : public Connection {
     }
 
     INFO("Received SetUpdatePriority: id={} priority={}", p->update_id, p->priority);
-
-    auto update_it = updates_.find(p->update_id);
-    if (update_it == updates_.end()) {
-      WARN("Failed to find update {} (potentially already finished?)", p->update_id);
-      return true;
-    }
-
-    set_priority(p->update_id, p->priority);
+    update_engine_.set_update_priority(update_handle_, p->update_id, p->priority);
     return true;
   }
 
@@ -242,7 +251,7 @@ struct ClientConnection : public Connection {
   }
 
   bool start_update(FileId id) {
-    absl::MutexLock lock(&cache_.files_mutex_);
+    absl::ReleasableMutexLock lock(&cache_.files_mutex_);
     auto file_it = cache_.files_.find(id);
     if (file_it == cache_.files_.end()) {
       ERROR("Failed to find file to update: id={}", id);
@@ -255,13 +264,12 @@ struct ClientConnection : public Connection {
       return false;
     }
 
-    const auto& checksum = *file_it->second.latest;
+    Checksum checksum = *file_it->second.latest;
     auto gen_it = file_it->second.generations.find(checksum);
     if (gen_it == file_it->second.generations.end()) {
       ERROR("Updated file generation is missing");
       return false;
     }
-    const auto& current_generation = gen_it->second;
 
     // TODO: Check the remote's generations.
     if (remote_files_[id].generations.contains(checksum)) {
@@ -275,134 +283,65 @@ struct ClientConnection : public Connection {
       return true;
     }
     remote_files_[id].current_generation = checksum;
+    lock.Release();
 
-    INFO("Starting update of {} to generation {}", filename, checksum.str());
-    UpdateId update_id = next_update_id_.fetch_add(1);
+    // TODO: Find a shared checksum.
+    std::optional<Checksum> base_checksum;
+    update_engine_.request_update(update_handle_, id, base_checksum, checksum);
+    return true;
+  }
 
-    unique_fd target_file = cache_.open_file_version_locked(id, checksum);
-    if (target_file == -1) {
-      ERROR("Failed to open {} generation {}: {}", filename, checksum.str(), strerror(errno));
-      return false;
-    }
-    updates_[update_id].fd = std::move(target_file);
-    priorities_[DEFAULT_PRIORITY_LEVEL].insert(update_id);
-
+  void on_update_begin(UpdateId update_id, FileId file_id, UpdateType update_type,
+                       CompressionType compression_type, uint64_t size, int64_t mtime,
+                       Checksum old_checksum, Checksum new_checksum) override final {
     Block buf(sizeof(BeginFileUpdate));
     auto p = reinterpret_cast<BeginFileUpdate*>(buf.data());
     p->update_id = update_id;
-    p->file_id = id;
-    p->update_type = UpdateType::FullTransfer;
-    p->compression_type = CompressionType::None;
-    p->size = current_generation.size;
-    p->mtime = current_generation.mtime;
-    memset(&p->old_checksum, 0, sizeof(p->old_checksum));
-    p->new_checksum = checksum;
+    p->file_id = file_id;
+    p->update_type = update_type;
+    p->compression_type = compression_type;
+    p->size = size;
+    p->mtime = mtime;
+    p->old_checksum = old_checksum;
+    p->new_checksum = new_checksum;
     write(CommandType::BeginFileUpdate, std::move(buf));
-
-    return true;
   }
 
- public:
-  UpdateId prioritized_update() {
-    if (updates_.empty()) {
-      ERROR("prioritized_update called with no updates");
-      abort();
-    }
-    auto& priority_updates = priorities_.begin()->second;
-    if (priority_updates.empty()) {
-      ERROR("Priority level with no updates");
-      abort();
-    }
-    return *priority_updates.begin();
-  }
+  void on_update(UpdateId update_id,
+                 std::function<ssize_t(void*, size_t)> populate_function) override final {
+    constexpr size_t buf_size = 256 * 1024;
+    Block buf(sizeof(FileUpdate) + buf_size);
 
- private:
-  void remove_priority(UpdateId id, PriorityLevel priority) {
-    auto priority_level_it = priorities_.find(priority);
-    if (priority_level_it == priorities_.end()) {
-      ERROR("Update's priority level is missing");
-      abort();
-    }
-
-    auto priority_it = priority_level_it->second.find(id);
-    if (priority_it == priority_level_it->second.end()) {
-      ERROR("Update is missing from its priority");
-      abort();
-    }
-    priority_level_it->second.erase(priority_it);
-    if (priority_level_it->second.empty()) {
-      priorities_.erase(priority_level_it);
-    }
-  }
-
-  void set_priority(UpdateId id, PriorityLevel priority) {
-    auto it = updates_.find(id);
-    if (it == updates_.end()) {
-      ERROR("Failed to find update {}", id);
-      abort();
-    }
-
-    if (priority == it->second.priority) {
+    auto p = reinterpret_cast<FileUpdate*>(buf.data());
+    p->update_id = update_id;
+    ssize_t rc = populate_function(p->data, buf_size);
+    if (rc == -1) {
+      send_die(fmt::format("Failed to read file while sending update: {}", strerror(errno)));
       return;
     }
 
-    remove_priority(id, it->second.priority);
-    it->second.priority = priority;
-    priorities_[priority].insert(id);
+    p->data_length = rc;
+    buf.resize(sizeof(FileUpdate) + rc);
+    DEBUG("Sending {} bytes in update {}", rc, update_id);
+    write(CommandType::FileUpdate, std::move(buf));
   }
 
-  void delete_update(UpdateId id) {
-    auto it = updates_.find(id);
-    if (it == updates_.end()) {
-      ERROR("Failed to find update {}", id);
-      abort();
-    }
+  void on_update_end(UpdateId update_id, bool success) override final {
+    INFO("Finishing update {}", update_id);
+    Block buf(sizeof(EndFileUpdate));
+    auto p = reinterpret_cast<EndFileUpdate*>(buf.data());
+    p->update_id = update_id;
+    p->success = success;
+    p->padding = 0;
+    write(CommandType::EndFileUpdate, std::move(buf));
+  }
 
-    remove_priority(id, it->second.priority);
-    updates_.erase(it);
+  bool ready_for_update_data() override final {
+    // TODO: Make configurable.
+    return bytes_queued() < 8 * 1024 * 1024;
   }
 
  public:
-  bool flush_updates() {
-    while (!updates_.empty() && bytes_queued() < 16 * 1024 * 1024) {
-      UpdateId update_id = prioritized_update();
-      auto it = updates_.find(update_id);
-      if (it == updates_.end()) {
-        ERROR("Failed to find prioritized update");
-        abort();
-      }
-
-      constexpr size_t buf_size = 1024 * 1024;
-      Block buf(sizeof(FileUpdate) + buf_size);
-
-      auto p = reinterpret_cast<FileUpdate*>(buf.data());
-      p->update_id = update_id;
-
-      // TODO: Move this operation off of the epoll thread.
-      ssize_t rc = TEMP_FAILURE_RETRY(read(it->second.fd.get(), p->data, buf_size));
-      if (rc == -1) {
-        ERROR("Failed to read file while sending update: {}", strerror(errno));
-        return false;
-      } else if (rc == 0) {
-        INFO("Finishing update {}", update_id);
-        Block buf(sizeof(EndFileUpdate));
-        auto p = reinterpret_cast<EndFileUpdate*>(buf.data());
-        p->update_id = update_id;
-        p->success = 1;
-        p->padding = 0;
-        write(CommandType::EndFileUpdate, std::move(buf));
-        delete_update(update_id);
-      } else {
-        DEBUG("Sending {} bytes in update {}", rc, update_id);
-        p->data_length = rc;
-        buf.resize(sizeof(FileUpdate) + rc);
-        write(CommandType::FileUpdate, std::move(buf));
-      }
-    }
-
-    return true;
-  }
-
   bool update_files(const std::vector<FileId>& changed_files) {
     if (!active_) return true;
 
@@ -414,6 +353,7 @@ struct ClientConnection : public Connection {
         }
       }
       advertised_ = true;
+      update_engine_.start(update_handle_);
     } else {
       // Otherwise, advertise only the ones that have changed.
       for (auto id : changed_files) {
@@ -422,9 +362,16 @@ struct ClientConnection : public Connection {
         }
       }
     }
-    return flush_updates();
+
+    return true;
   }
 
+  bool flush_updates() {
+    update_engine_.check_flush(update_handle_);
+    return true;
+  }
+
+ private:
   struct RemoteFile {
     absl::flat_hash_set<Checksum> generations;
 
@@ -439,16 +386,8 @@ struct ClientConnection : public Connection {
 
   absl::flat_hash_map<FileId, RemoteFile> remote_files_;
   GenerationCache& cache_;
-
-  struct Update {
-    unique_fd fd;
-    PriorityLevel priority = DEFAULT_PRIORITY_LEVEL;
-  };
-
-  std::atomic<UpdateId> next_update_id_ = 9000;
-
-  absl::btree_map<PriorityLevel, absl::btree_set<UpdateId>> priorities_;
-  absl::btree_map<UpdateId, Update> updates_;
+  UpdateEngine& update_engine_;
+  UpdateHandle update_handle_;
 
   bool active_ = false;
   bool advertised_ = false;
@@ -476,6 +415,8 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
     ERROR("Failed to initialize generation cache, exiting");
     abort();
   }
+
+  UpdateEngine update_engine(cache);
 
   FileMonitor file_monitor;
   absl::flat_hash_map<FileId, std::filesystem::path> monitored_paths;
@@ -509,7 +450,7 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
     }
   }
 
-  absl::flat_hash_map<borrowed_fd, std::unique_ptr<ClientConnection>> clients;
+  absl::flat_hash_map<borrowed_fd, std::shared_ptr<ClientConnection>> clients;
   while (true) {
     for (FileId changed_file : changed_files) {
       cache.update_file(changed_file, monitored_paths[changed_file]);
@@ -535,7 +476,8 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
         unique_fd client_fd = accept_client(sockfd);
         INFO("Accepted new client: {}", client_fd.get());
         int client_fd_raw = client_fd.get();
-        auto connection = std::make_unique<ClientConnection>(epfd, std::move(client_fd), cache);
+        auto connection =
+          ClientConnection::construct(epfd, std::move(client_fd), cache, update_engine);
         clients.emplace(client_fd_raw, std::move(connection));
         continue;
       }
