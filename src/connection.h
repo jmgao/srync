@@ -131,6 +131,7 @@ struct Connection {
         ERROR("read failed (fd={}): {}", fd_.get(), strerror(errno));
         return false;
       } else if (rc == 0) {
+        ERROR("read hit EOF of socket");
         return false;
       }
       block.resize(rc);
@@ -156,6 +157,7 @@ struct Connection {
 
       Block packet_data = input_queue_.take_front(packet_header_->data_length).coalesce();
       if (!process_read(*packet_header_, std::move(packet_data))) {
+        ERROR("process_read returned failure");
         return false;
       }
       packet_header_.reset();

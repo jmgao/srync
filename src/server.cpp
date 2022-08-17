@@ -559,16 +559,24 @@ int server_main(std::string host, int port, std::vector<std::filesystem::path> l
         unique_fd client_fd = accept_client(sockfd);
         INFO("Accepted new client: {}", client_fd.get());
         int client_fd_raw = client_fd.get();
-        auto connection =
-          std::make_unique<ClientConnection>(epfd, std::move(client_fd), files, cache);
+        auto connection = std::make_unique<ClientConnection>(epfd, std::move(client_fd), cache);
         clients.emplace(client_fd_raw, std::move(connection));
         continue;
       }
 
       auto it = clients.find(event->data.fd);
       if (it != clients.end()) {
-        if (!it->second->process_events(event->events) || !it->second->flush_updates()) {
-          WARN("Terminating client connection (fd={})", static_cast<int>(event->data.fd));
+        bool terminate = false;
+        if (!it->second->process_events(event->events)) {
+          WARN("Terminating client connection: process_events returned failure (fd={})",
+               static_cast<int>(event->data.fd));
+          terminate = true;
+        } else if (!it->second->flush_updates()) {
+          WARN("Terminating client connection: flush_updates returned failure (fd={})",
+               static_cast<int>(event->data.fd));
+          terminate = true;
+        }
+        if (terminate) {
           clients.erase(it);
         }
         continue;
